@@ -2,7 +2,7 @@ import asyncio
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from hummingbot.connector.exchange.mexc import mexc_constants as CONSTANTS, mexc_web_utils as web_utils
+from hummingbot.connector.exchange.mexc import mexc_constants as CONSTANTS, mexc_web_utils as web_utils, mexc_utils
 from hummingbot.connector.exchange.mexc.mexc_order_book import MexcOrderBook
 from hummingbot.core.data_type.order_book_message import OrderBookMessage
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
@@ -70,30 +70,28 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
         :param ws: the websocket assistant used to connect to the exchange
         """
         try:
-            trade_params = []
-            depth_params = []
+            trade_params: List[str] = []
+            depth_params: List[str] = []
             for trading_pair in self._trading_pairs:
-                symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-                trade_params.append(f"spot@public.deals.v3.api@{symbol}")
-                depth_params.append(f"spot@public.increase.depth.v3.api@{symbol}")
-            payload = {
+                symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)  # e.g. BTC-USDT
+                ex_symbol = mexc_utils.to_exchange_symbol(symbol)  # -> BTCUSDT
+                trade_params.append(web_utils.topic_aggr_deals(ex_symbol, 100))
+                depth_params.append(web_utils.topic_aggr_depth(ex_symbol, 100))
+
+            await ws.send(WSJSONRequest(payload={
                 "method": "SUBSCRIPTION",
                 "params": trade_params,
-                "id": 1
-            }
-            subscribe_trade_request: WSJSONRequest = WSJSONRequest(payload=payload)
-
-            payload = {
+                "id": self.TRADE_STREAM_ID
+            }))
+            await ws.send(WSJSONRequest(payload={
                 "method": "SUBSCRIPTION",
                 "params": depth_params,
-                "id": 2
-            }
-            subscribe_orderbook_request: WSJSONRequest = WSJSONRequest(payload=payload)
+                "id": self.DIFF_STREAM_ID
+           }))
+            # ping initial (et tu peux programmer un ping périodique côté task si besoin)
+            await ws.send(WSJSONRequest(payload={"method": "PING"}))
 
-            await ws.send(subscribe_trade_request)
-            await ws.send(subscribe_orderbook_request)
-
-            self.logger().info("Subscribed to public order book and trade channels...")
+            self.logger().info("Subscribed to trades & depth channels (Spot V3 Protobuf).")
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -105,8 +103,7 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
-        await ws.connect(ws_url=CONSTANTS.WSS_URL.format(self._domain),
-                         ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL)
+        await ws.connect(ws_url=CONSTANTS.WSS_URL, ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL)
         return ws
 
     async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
@@ -119,25 +116,58 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
         )
         return snapshot_msg
 
-    async def _parse_trade_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
-        if "code" not in raw_message:
-            trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=raw_message["s"])
-            for sinlge_msg in raw_message['d']['deals']:
-                trade_message = MexcOrderBook.trade_message_from_exchange(
-                    sinlge_msg, timestamp=raw_message['t'], metadata={"trading_pair": trading_pair})
-                message_queue.put_nowait(trade_message)
+    async def _parse_trade_message(self, wrapper: ws_pb2.PushDataV3ApiWrapper, message_queue: asyncio.Queue):
+         payload = ws_pb2.PublicDeals()
+         payload.ParseFromString(wrapper.payload)
+         symbol = wrapper.channel.split("@")[-1]   # ...@100ms@BTCUSDT
+         trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=symbol)
+         for deal in payload.dealsList:
+             trade_message = MexcOrderBook.trade_message_from_protobuf(
+                 deal, metadata={"trading_pair": trading_pair}
+             )
+             message_queue.put_nowait(trade_message)
+ 
 
-    async def _parse_order_book_diff_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
-        if "code" not in raw_message:
-            trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=raw_message["s"])
-            order_book_message: OrderBookMessage = MexcOrderBook.diff_message_from_exchange(
-                raw_message, raw_message['t'], {"trading_pair": trading_pair})
-            message_queue.put_nowait(order_book_message)
+    async def _parse_order_book_diff_message(self, wrapper: ws_pb2.PushDataV3ApiWrapper, message_queue: asyncio.Queue):
+        payload = ws_pb2.PublicAggreDepths()
+        payload.ParseFromString(wrapper.payload)
+        symbol = wrapper.channel.split("@")[-1]   # ...@100ms@BTCUSDT
+        trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=symbol)
+        bids = [(d.price, d.volume) for d in payload.bidsList]
+        asks = [(d.price, d.volume) for d in payload.asksList]
+        ob_message: OrderBookMessage = MexcOrderBook.diff_message_from_protobuf(
+            bids=bids, asks=asks, update_id=payload.toVersion, metadata={"trading_pair": trading_pair}
+        )
+        message_queue.put_nowait(ob_message)
 
-    def _channel_originating_message(self, event_message: Dict[str, Any]) -> str:
-        channel = ""
-        if "code" not in event_message:
-            event_type = event_message.get("c", "")
-            channel = (self._diff_messages_queue_key if CONSTANTS.DIFF_EVENT_TYPE in event_type
-                       else self._trade_messages_queue_key)
-        return channel
+    def _channel_originating_message(self, wrapper: ws_pb2.PushDataV3ApiWrapper) -> str:
+         channel = wrapper.channel
+         if "aggre.depth.v3.api.pb" in channel:
+             return self._diff_messages_queue_key
+         elif "aggre.deals.v3.api.pb" in channel:
+             return self._trade_messages_queue_key
+         return ""
+
+    async def _process_websocket_messages(self, ws: WSAssistant) -> None:
+        """
+        Lit les frames binaires protobuf et route vers les parseurs.
+        """
+        async for raw in ws.iter_raw():
+            # On s'attend à des frames binaires (wrapper protobuf). Certains serveurs envoient parfois du PONG texte.
+            if not isinstance(raw, (bytes, bytearray)):
+                continue
+            wrapper = ws_pb2.PushDataV3ApiWrapper()
+            try:
+                wrapper.ParseFromString(raw)
+            except Exception:
+                self.logger().debug("Failed to parse protobuf wrapper", exc_info=True)
+                continue
+
+            try:
+                queue_key = self._channel_originating_message(wrapper)
+                if queue_key == self._diff_messages_queue_key:
+                    await self._parse_order_book_diff_message(wrapper, self._message_queue[self._diff_messages_queue_key])
+                elif queue_key == self._trade_messages_queue_key:
+                    await self._parse_trade_message(wrapper, self._message_queue[self._trade_messages_queue_key])
+            except Exception:
+                self.logger().warning(f"Error processing channel={wrapper.channel}", exc_info=True)
