@@ -1,5 +1,5 @@
 from decimal import Decimal
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 from pydantic import ConfigDict, Field, SecretStr
 
@@ -14,6 +14,29 @@ DEFAULT_FEES = TradeFeeSchema(
     taker_percent_fee_decimal=Decimal("0.0005"),
     buy_percent_fee_deducted_from_returns=True
 )
+
+def split_trading_pair(trading_pair: str) -> Tuple[str, str]:
+     return trading_pair.split("-")
+ 
+def to_exchange_symbol(hb_trading_pair: str) -> str:
+    """
+    Hummingbot garde 'BTC-USDT' en interne. MEXC WS Spot V3 attend 'BTCUSDT'.
+    """
+    return hb_trading_pair.replace("-", "").upper()
+
+def from_exchange_symbol(exchange_symbol: str) -> str:
+    # utilisé si besoin pour remapper vers le format interne
+    # heuristique simple la plus fréquente (XX.../USDT, etc.)
+    if exchange_symbol.endswith("USDT"):
+        base = exchange_symbol[:-4]
+        quote = "USDT"
+    elif exchange_symbol.endswith("USDC"):
+        base = exchange_symbol[:-4]
+        quote = "USDC"
+    else:
+        # fallback: on garde tout en base et 'USDT' en quote (évite de casser)
+        base, quote = exchange_symbol, "USDT"
+    return f"{base}-{quote}"
 
 
 def is_exchange_information_valid(exchange_info: Dict[str, Any]) -> bool:
