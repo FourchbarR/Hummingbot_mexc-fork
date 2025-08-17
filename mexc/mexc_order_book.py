@@ -3,10 +3,39 @@ from typing import Dict, Optional
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.order_book import OrderBook
 from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
-
+from decimal import Decimal
+import time
+from typing import Any, List, Tuple, Dict, Optional
+from .proto import ws_pb2
 
 class MexcOrderBook(OrderBook):
+    @staticmethod
+    def trade_message_from_protobuf(deal: "ws_pb2.PublicDeals.Deal", metadata: Dict[str, Any]) -> OrderBookMessage:
+        # Champs habituels côté MEXC protobuf: deal.id, deal.price, deal.volume, deal.dealType (BUY/SELL enum), deal.ts
+        trade_type = TradeType.BUY if deal.dealType == ws_pb2.BUY else TradeType.SELL
+        return OrderBookMessage(
+            message_type=OrderBookMessageType.TRADE,
+            content={
+                "trade_id": str(deal.id),
+                "price": Decimal(str(deal.price)),
+                "amount": Decimal(str(deal.volume)),
+                "trade_type": trade_type,
+            },
+            timestamp=deal.ts / 1000.0,
+            metadata=metadata,
+        )
 
+    @staticmethod
+    def diff_message_from_protobuf(bids: List[Tuple[float, float]], asks: List[Tuple[float, float]],
+                                   update_id: int, metadata: Dict[str, Any]) -> OrderBookMessage:
+        # Convertit vers Decimals pour rester conforme au reste d’HB
+        content = {
+            "bids": [(Decimal(str(p)), Decimal(str(q))) for p, q in bids],
+            "asks": [(Decimal(str(p)), Decimal(str(q))) for p, q in asks],
+            "update_id": update_id,
+        }
+        return OrderBookMessage(OrderBookMessageType.DIFF, content=content, timestamp=time.time(), metadata=metadata)
+    
     @classmethod
     def snapshot_message_from_exchange(cls,
                                        msg: Dict[str, any],
