@@ -10,6 +10,7 @@ from hummingbot.core.web_assistant.connections.data_types import RESTMethod, WSJ
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 from hummingbot.core.web_assistant.ws_assistant import WSAssistant
 from hummingbot.logger import HummingbotLogger
+from .proto import ws_pb2
 
 if TYPE_CHECKING:
     from hummingbot.connector.exchange.mexc.mexc_exchange import MexcExchange
@@ -301,10 +302,40 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
     async def _process_websocket_messages(self, websocket_assistant: WSAssistant, queue: asyncio.Queue):
         while True:
             try:
-                await asyncio.wait_for(
-                    super()._process_websocket_messages(websocket_assistant=websocket_assistant, queue=queue),
-                    timeout=CONSTANTS.WS_CONNECTION_TIME_INTERVAL
-                )
-            except asyncio.TimeoutError:
-                ping_request = WSJSONRequest(payload={"method": "PING"})
-                await websocket_assistant.send(ping_request)
+                async for raw in websocket_assistant.iter_raw():
+                    # Certains serveurs envoient du texte 'PONG'
+                    if not isinstance(raw, (bytes, bytearray)):
+                        continue
+                    wrapper = ws_pb2.PushDataV3ApiWrapper()
+                    try:
+                        wrapper.ParseFromString(raw)
+                    except Exception:
+                        self.logger().debug("Failed to parse protobuf wrapper (private)", exc_info=True)
+                        continue
+
+                    ch = wrapper.channel
+                    # Route selon le channel
+                    if "private.deals.v3.api.pb" in ch:
+                        payload = ws_pb2.PrivateDeals()
+                        payload.ParseFromString(wrapper.payload)
+                        # Place sur la queue sous forme dict "standard HB"
+                        queue.put_nowait({"event": "user_trades", "channel": ch, "payload": payload})
+
+                    elif "private.orders.v3.api.pb" in ch:
+                        payload = ws_pb2.PrivateOrders()
+                        payload.ParseFromString(wrapper.payload)
+                        queue.put_nowait({"event": "user_orders", "channel": ch, "payload": payload})
+
+                    elif "private.account.v3.api.pb" in ch:
+                        payload = ws_pb2.PrivateAccount()
+                        payload.ParseFromString(wrapper.payload)
+                        queue.put_nowait({"event": "user_balance", "channel": ch, "payload": payload})
+
+                # si on sort de l'async for: on envoie un ping et boucle
+                await websocket_assistant.send(WSJSONRequest(payload={"method": "PING"}))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger().warning("Error processing private WS frame", exc_info=True)
+                # petit ping pour garder la co en vie, puis continue
+                await websocket_assistant.send(WSJSONRequest(payload={"method": "PING"}))
