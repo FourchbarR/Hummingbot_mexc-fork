@@ -91,7 +91,7 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
         # Get a websocket assistant and connect it
         ws = await self._get_ws_assistant()
-        url = f"{CONSTANTS.WSS_URL.format(self._domain)}?listenKey={self._current_listen_key}"
+        url = f"{CONSTANTS.WSS_URL}?listenKey={self._current_listen_key}"
 
         self.logger().info(f"Connecting to user stream with listen key {self._current_listen_key}")
         await ws.connect(ws_url=url, ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL)
@@ -158,7 +158,7 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
         while True:
             try:
                 data = await rest_assistant.execute_request(
-                    url=web_utils.public_rest_url(path_url=CONSTANTS.MEXC_USER_STREAM_PATH_URL, domain=self._domain),
+                    url=web_utils.private_rest_url(path_url=CONSTANTS.MEXC_USER_STREAM_PATH_URL, domain=self._domain),
                     method=RESTMethod.POST,
                     throttler_limit_id=CONSTANTS.MEXC_USER_STREAM_PATH_URL,
                     is_auth_required=True,
@@ -180,7 +180,7 @@ class MexcAPIUserStreamDataSource(UserStreamTrackerDataSource):
         rest_assistant = await self._api_factory.get_rest_assistant()
         try:
             data = await rest_assistant.execute_request(
-                url=web_utils.public_rest_url(path_url=CONSTANTS.MEXC_USER_STREAM_PATH_URL, domain=self._domain),
+                url=web_utils.private_rest_url(path_url=CONSTANTS.MEXC_USER_STREAM_PATH_URL, domain=self._domain),
                 params={"listenKey": self._current_listen_key},
                 method=RESTMethod.PUT,
                 return_err=True,
